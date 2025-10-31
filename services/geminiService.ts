@@ -1,13 +1,17 @@
-import { GoogleGenAI } from "@google/genai";
-import type { SearchResult, ApiError, GroundingChunk, Article } from '../types';
+import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
+import type { StreamEvent, GroundingChunk, Article } from '../types';
 
 // Per guidelines, initialize with API key from environment variables.
 const ai = new GoogleGenAI({apiKey: process.env.API_KEY!});
 
-const prompt = `
-  You are the search engine for "Omega," a tool that ONLY provides links to articles from factually verified, authoritative sources. Your ONLY output should be a single JSON code block. Do not add any introductory or closing text.
+// Session-based cache to store search results for a given query.
+const queryCache = new Map<string, { articles: Article[], citations: GroundingChunk[] }>();
 
-  Based on the user's query, find between 5 and 10 relevant articles.
+
+const prompt = `
+  You are the search engine for "Omega," a tool that ONLY provides links to articles from factually verified, authoritative sources.
+
+  Based on the user's query, find between 10 and 15 relevant articles.
 
   **CRITICAL RULES FOR SOURCE VERIFICATION:**
   1.  **ALLOWED SOURCES:** Prioritize academic journals, government websites (.gov), university websites (.edu), reputable scientific repositories (e.g., arXiv.org, osf.io), major non-partisan news organizations with a history of fact-checking (e.g., Reuters, Associated Press, BBC News), and professionally-curated encyclopedias (e.g., Encyclopedia Britannica).
@@ -15,24 +19,41 @@ const prompt = `
   3.  **URL ACCURACY IS PARAMOUNT:** You MUST ONLY use direct, working URLs found by the search tool. Before outputting a URL, mentally verify that it is not a broken link or a redirect. Do not invent, guess, or modify URLs in any way. If a link from the search tool appears broken or irrelevant, discard that source. An incorrect URL is a critical failure.
 
   **OUTPUT FORMAT:**
-  Your response must be a single JSON object wrapped in a markdown code block (\`\`\`json ... \`\`\`). The JSON object must have a single key "articles" which is an array of article objects. Each article object must contain:
+  Your response must be a stream of individual JSON objects. For each article you find, immediately output a single, complete JSON object. Each JSON object must be a single line. Do not wrap the objects in an array or a markdown block. Each object must contain:
   - "articleTitle": The full title of the article.
   - "url": The direct URL to the article.
   - "summary": A brief, neutral, one-to-two-sentence summary of the article's content.
   - "sourceName": The name of the publication or website.
 
-  Do not output anything besides the JSON code block.
+  Do not output anything besides the stream of JSON objects.
 
   The user's query is:
 `;
 
-export const performSearch = async (query: string): Promise<SearchResult | ApiError> => {
-  if (!query.trim()) {
-    return { articles: [], chunks: [] };
+export async function* streamSearch(query: string): AsyncGenerator<StreamEvent, void, unknown> {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return;
   }
 
+  // Check cache first
+  if (queryCache.has(normalizedQuery)) {
+    const cachedResult = queryCache.get(normalizedQuery)!;
+    console.log("Serving from cache:", normalizedQuery);
+    for (const article of cachedResult.articles) {
+      yield { type: 'article', payload: article };
+    }
+    if (cachedResult.citations.length > 0) {
+      yield { type: 'citations', payload: cachedResult.citations };
+    }
+    return;
+  }
+
+  console.log("Performing new search:", normalizedQuery);
+  const articlesForCache: Article[] = [];
+
   try {
-    const response = await ai.models.generateContent({
+    const responseStream = await ai.models.generateContentStream({
       model: "gemini-2.5-flash",
       contents: `${prompt} "${query}"`,
       config: {
@@ -40,36 +61,57 @@ export const performSearch = async (query: string): Promise<SearchResult | ApiEr
       },
     });
 
-    const rawText = response.text;
-    
-    // Regex to extract content from a JSON markdown block
-    const jsonMatch = rawText.match(/```json\s*([\s\S]*?)\s*```/);
-    if (!jsonMatch || !jsonMatch[1]) {
-      // Fallback for when the model doesn't use markdown block
-      try {
-        const result: { articles: Article[] } = JSON.parse(rawText);
-        const chunks: GroundingChunk[] = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-        return { articles: result.articles || [], chunks };
-      } catch (e) {
-         throw new Error("The service failed to return a valid JSON response format.");
-      }
+    let buffer = '';
+    let lastSeenCitations: GroundingChunk[] = [];
+
+    for await (const chunk of responseStream) {
+        const text = chunk.text;
+        buffer += text;
+
+        let braceCount = 0;
+        let startIndex = -1;
+
+        for (let i = 0; i < buffer.length; i++) {
+            if (buffer[i] === '{') {
+                if (startIndex === -1) startIndex = i;
+                braceCount++;
+            } else if (buffer[i] === '}') {
+                braceCount--;
+                if (braceCount === 0 && startIndex !== -1) {
+                    const jsonString = buffer.substring(startIndex, i + 1);
+                    try {
+                        const article: Article = JSON.parse(jsonString);
+                        articlesForCache.push(article); // Add to cache list
+                        yield { type: 'article', payload: article };
+                    } catch (e) {
+                        console.warn('Failed to parse JSON chunk:', jsonString);
+                    }
+                    buffer = buffer.substring(i + 1);
+                    startIndex = -1;
+                    i = -1; 
+                }
+            }
+        }
+        
+        const citations = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        if (citations && citations.length > 0) {
+            lastSeenCitations = citations;
+        }
     }
     
-    const jsonText = jsonMatch[1];
+    if (lastSeenCitations.length > 0) {
+        yield { type: 'citations', payload: lastSeenCitations };
+    }
     
-    const result: { articles: Article[] } = JSON.parse(jsonText);
-    const chunks: GroundingChunk[] = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    // Store the complete result in the cache for future use
+    queryCache.set(normalizedQuery, { articles: articlesForCache, citations: lastSeenCitations });
 
-    return { articles: result.articles || [], chunks };
   } catch (error) {
     console.error("Error performing search:", error);
     let message = 'An unknown error occurred';
     if (error instanceof Error) {
         message = error.message;
     }
-    if (message.includes('JSON') || message.includes('service failed')) {
-        message = 'The service failed to return a valid response. Please try rephrasing your search.'
-    }
-    return { message: `An error occurred during the search: ${message}` };
+    yield { type: 'error', payload: `An error occurred during the search: ${message}` };
   }
-};
+}

@@ -22,3 +22,8 @@ export interface SearchResult {
 export interface ApiError {
   message: string;
 }
+
+export type StreamEvent = 
+  | { type: 'article'; payload: Article } 
+  | { type: 'citations'; payload: GroundingChunk[] } 
+  | { type: 'error'; payload: string };
